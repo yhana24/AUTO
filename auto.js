@@ -1,502 +1,228 @@
-const fs = require('fs');
-const path = require('path');
-const login = require('./fb-chat-api/index');
-const express = require('express');
-const app = express();
-const chalk = require('chalk');
-const bodyParser = require('body-parser');
-const script = path.join(__dirname, 'script');
-const cron = require('node-cron');
-const config = fs.existsSync('./data') && fs.existsSync('./data/config.json') ? JSON.parse(fs.readFileSync('./data/config.json', 'utf8')) : createConfig();
-const Utils = new Object({
-  commands: new Map(),
-  handleEvent: new Map(),
-  account: new Map(),
-  cooldowns: new Map(),
-});
-fs.readdirSync(script).forEach((file) => {
-  const scripts = path.join(script, file);
-  const stats = fs.statSync(scripts);
-  if (stats.isDirectory()) {
-    fs.readdirSync(scripts).forEach((file) => {
-      try {
-        const {
-          config,
-          run,
-          handleEvent
-        } = require(path.join(scripts, file));
-        if (config) {
-          const {
-            name = [], role = '0', version = '1.0.0', hasPrefix = true, aliases = [], description = '', usage = '', credits = '', cooldown = '5'
-          } = Object.fromEntries(Object.entries(config).map(([key, value]) => [key.toLowerCase(), value]));
-          aliases.push(name);
-          if (run) {
-            Utils.commands.set(aliases, {
-              name,
-              role,
-              run,
-              aliases,
-              description,
-              usage,
-              version,
-              hasPrefix: config.hasPrefix,
-              credits,
-              cooldown
-            });
-          }
-          if (handleEvent) {
-            Utils.handleEvent.set(aliases, {
-              name,
-              handleEvent,
-              role,
-              description,
-              usage,
-              version,
-              hasPrefix: config.hasPrefix,
-              credits,
-              cooldown
-            });
-          }
-        }
-      } catch (error) {
-        console.error(chalk.red(`Error installing command from file ${file}: ${error.message}`));
-      }
-    });
-  } else {
-    try {
-      const {
-        config,
-        run,
-        handleEvent
-      } = require(scripts);
-      if (config) {
-        const {
-          name = [], role = '0', version = '1.0.0', hasPrefix = true, aliases = [], description = '', usage = '', credits = '', cooldown = '5'
-        } = Object.fromEntries(Object.entries(config).map(([key, value]) => [key.toLowerCase(), value]));
-        aliases.push(name);
-        if (run) {
-          Utils.commands.set(aliases, {
-            name,
-            role,
-            run,
-            aliases,
-            description,
-            usage,
-            version,
-            hasPrefix: config.hasPrefix,
-            credits,
-            cooldown
-          });
-        }
-        if (handleEvent) {
-          Utils.handleEvent.set(aliases, {
-            name,
-            handleEvent,
-            role,
-            description,
-            usage,
-            version,
-            hasPrefix: config.hasPrefix,
-            credits,
-            cooldown
-          });
-        }
-      }
-    } catch (error) {
-      console.error(chalk.red(`Error installing command from file ${file}: ${error.message}`));
-    }
-  }
-});
-app.use(express.static(path.join(__dirname, 'public')));
-app.use(bodyParser.json());
-app.use(express.json());
-const routes = [{
-  path: '/',
-  file: 'index.html'
-}, {
-  path: '/step_by_step_guide',
-  file: 'guide.html'
-}, {
-  path: '/online_user',
-  file: 'online.html'
-}, ];
-routes.forEach(route => {
-  app.get(route.path, (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', route.file));
-  });
-});
-app.get('/info', (req, res) => {
-  const data = Array.from(Utils.account.values()).map(account => ({
-    name: account.name,
-    profileUrl: account.profileUrl,
-    thumbSrc: account.thumbSrc,
-    time: account.time
-  }));
-  res.json(JSON.parse(JSON.stringify(data, null, 2)));
-});
-app.get('/commands', (req, res) => {
-  const command = new Set();
-  const commands = [...Utils.commands.values()].map(({
-    name
-  }) => (command.add(name), name));
-  const handleEvent = [...Utils.handleEvent.values()].map(({
-    name
-  }) => command.has(name) ? null : (command.add(name), name)).filter(Boolean);
-  const role = [...Utils.commands.values()].map(({
-    role
-  }) => (command.add(role), role));
-  const aliases = [...Utils.commands.values()].map(({
-    aliases
-  }) => (command.add(aliases), aliases));
-  res.json(JSON.parse(JSON.stringify({
-    commands,
-    handleEvent,
-    role,
-    aliases
-  }, null, 2)));
-});
-app.post('/login', async (req, res) => {
-  const {
-    state,
-    commands,
-    prefix,
-    admin
-  } = req.body;
-  try {
-    if (!state) {
-      throw new Error('Missing app state data');
-    }
-    const cUser = state.find(item => item.key === 'c_user');
-    if (cUser) {
-      const existingUser = Utils.account.get(cUser.value);
-      if (existingUser) {
-        console.log(`User ${cUser.value} is already logged in`);
-        return res.status(400).json({
-          error: false,
-          message: "Active user session detected; already logged in",
-          user: existingUser
-        });
-      } else {
-        try {
-          await accountLogin(state, commands, prefix, [admin]);
-          res.status(200).json({
-            success: true,
-            message: 'Authentication process completed successfully; login achieved.'
-          });
-        } catch (error) {
-          console.error(error);
-          res.status(400).json({
-            error: true,
-            message: error.message
-          });
-        }
-      }
-    } else {
-      return res.status(400).json({
-        error: true,
-        message: "There's an issue with the appstate data; it's invalid."
-      });
-    }
-  } catch (error) {
-    return res.status(400).json({
-      error: true,
-      message: "There's an issue with the appstate data; it's invalid."
-    });
-  }
-});
-app.listen(3000, () => {
-  console.log(`Server is running at http://localhost:5000`);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled Promise Rejection:', reason);
-});
-async function accountLogin(state, enableCommands = [], prefix, admin = []) {
-  return new Promise((resolve, reject) => {
-    login({
-      appState: state
-    }, async (error, api) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      const userid = await api.getCurrentUserID();
-      addThisUser(userid, enableCommands, state, prefix, admin);
-      try {
-        const userInfo = await api.getUserInfo(userid);
-        if (!userInfo || !userInfo[userid]?.name || !userInfo[userid]?.profileUrl || !userInfo[userid]?.thumbSrc) throw new Error('Unable to locate the account; it appears to be in a suspended or locked state.');
-        const {
-          name,
-          profileUrl,
-          thumbSrc
-        } = userInfo[userid];
-        let time = (JSON.parse(fs.readFileSync('./data/history.json', 'utf-8')).find(user => user.userid === userid) || {}).time || 0;
-        Utils.account.set(userid, {
-          name,
-          profileUrl,
-          thumbSrc,
-          time: time
-        });
-        const intervalId = setInterval(() => {
-          try {
-            const account = Utils.account.get(userid);
-            if (!account) throw new Error('Account not found');
-            Utils.account.set(userid, {
-              ...account,
-              time: account.time + 1
-            });
-          } catch (error) {
-            clearInterval(intervalId);
-            return;
-          }
-        }, 1000);
-      } catch (error) {
-        reject(error);
-        return;
-      }
-      api.setOptions({
-        listenEvents: config[0].fcaOption.listenEvents,
-        logLevel: config[0].fcaOption.logLevel,
-        updatePresence: config[0].fcaOption.updatePresence,
-        selfListen: config[0].fcaOption.selfListen,
-        forceLogin: config[0].fcaOption.forceLogin,
-        online: config[0].fcaOption.online,
-        autoMarkDelivery: config[0].fcaOption.autoMarkDelivery,
-        autoMarkRead: config[0].fcaOption.autoMarkRead,
-      });
-      try {
-        var listenEmitter = api.listenMqtt(async (error, event) => {
-          if (error) {
-            if (error === 'Connection closed.') {
-              console.error(`Error during API listen: ${error}`, userid);
-            }
-            console.log(error)
-          }
-          let database = fs.existsSync('./data/database.json') ? JSON.parse(fs.readFileSync('./data/database.json', 'utf8')) : createDatabase();
-          let data = Array.isArray(database) ? database.find(item => Object.keys(item)[0] === event?.threadID) : {};
-          let adminIDS = data ? database : createThread(event.threadID, api);
-          let blacklist = (JSON.parse(fs.readFileSync('./data/history.json', 'utf-8')).find(blacklist => blacklist.userid === userid) || {}).blacklist || [];
-          let hasPrefix = (event.body && aliases((event.body || '')?.trim().toLowerCase().split(/ +/).shift())?.hasPrefix == false) ? '' : prefix;
-          let [command, ...args] = ((event.body || '').trim().toLowerCase().startsWith(hasPrefix?.toLowerCase()) ? (event.body || '').trim().substring(hasPrefix?.length).trim().split(/\s+/).map(arg => arg.trim()) : []);
-          if (hasPrefix && aliases(command)?.hasPrefix === false) {
-            api.sendMessage(`Invalid usage this command doesn't need a prefix`, event.threadID, event.messageID);
-            return;
-          }
-          if (event.body && aliases(command)?.name) {
-            const role = aliases(command)?.role ?? 0;
-            const isAdmin = config?.[0]?.masterKey?.admin?.includes(event.senderID) || admin.includes(event.senderID);
-            const isThreadAdmin = isAdmin || ((Array.isArray(adminIDS) ? adminIDS.find(admin => Object.keys(admin)[0] === event.threadID) : {})?.[event.threadID] || []).some(admin => admin.id === event.senderID);
-            if ((role == 1 && !isAdmin) || (role == 2 && !isThreadAdmin) || (role == 3 && !config?.[0]?.masterKey?.admin?.includes(event.senderID))) {
-              api.sendMessage(`You don't have permission to use this command.`, event.threadID, event.messageID);
-              return;
-            }
-          }
-          if (event.body && event.body?.toLowerCase().startsWith(prefix.toLowerCase()) && aliases(command)?.name) {
-            if (blacklist.includes(event.senderID)) {
-              api.sendMessage("We're sorry, but you've been banned from using bot. If you believe this is a mistake or would like to appeal, please contact one of the bot admins for further assistance.", event.threadID, event.messageID);
-              return;
-            }
-          }
-          if (event.body && aliases(command)?.name) {
-            const now = Date.now();
-            const name = aliases(command)?.name;
-            const sender = Utils.cooldowns.get(`${event.senderID}_${name}_${userid}`);
-            const delay = aliases(command)?.cooldown ?? 0;
-            if (!sender || (now - sender.timestamp) >= delay * 1000) {
-              Utils.cooldowns.set(`${event.senderID}_${name}_${userid}`, {
-                timestamp: now,
-                command: name
-              });
-            } else {
-              const active = Math.ceil((sender.timestamp + delay * 1000 - now) / 1000);
-              api.sendMessage(`Please wait ${active} seconds before using the "${name}" command again.`, event.threadID, event.messageID);
-              return;
-            }
-          }
-          if (event.body && !command && event.body?.toLowerCase().startsWith(prefix.toLowerCase())) {
-            api.sendMessage(`Invalid command please use ${prefix}help to see the list of available commands.`, event.threadID, event.messageID);
-            return;
-          }
-          if (event.body && command && prefix && event.body?.toLowerCase().startsWith(prefix.toLowerCase()) && !aliases(command)?.name) {
-            api.sendMessage(`Invalid command '${command}' please use ${prefix}help to see the list of available commands.`, event.threadID, event.messageID);
-            return;
-          }
-          for (const {
-              handleEvent,
-              name
-            }
-            of Utils.handleEvent.values()) {
-            if (handleEvent && name && (
-                (enableCommands[1].handleEvent || []).includes(name) || (enableCommands[0].commands || []).includes(name))) {
-              handleEvent({
-                api,
-                event,
-                enableCommands,
-                admin,
-                prefix,
-                blacklist
-              });
-            }
-          }
-          switch (event.type) {
-            case 'message':
-            case 'message_reply':
-            case 'message_unsend':
-            case 'message_reaction':
-              if (enableCommands[0].commands.includes(aliases(command?.toLowerCase())?.name)) {
-                await ((aliases(command?.toLowerCase())?.run || (() => {}))({
-                  api,
-                  event,
-                  args,
-                  enableCommands,
-                  admin,
-                  prefix,
-                  blacklist,
-                  Utils,
-                }));
-              }
-              break;
-          }
-        });
-      } catch (error) {
-        console.error('Error during API listen, outside of listen', userid);
-        Utils.account.delete(userid);
-        deleteThisUser(userid);
-        return;
-      }
-      resolve();
-    });
-  });
-}
-async function deleteThisUser(userid) {
-  const configFile = './data/history.json';
-  let config = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
-  const sessionFile = path.join('./data/session', `${userid}.json`);
-  const index = config.findIndex(item => item.userid === userid);
-  if (index !== -1) config.splice(index, 1);
-  fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
-  try {
-    fs.unlinkSync(sessionFile);
-  } catch (error) {
-    console.log(error);
-  }
-}
-async function addThisUser(userid, enableCommands, state, prefix, admin, blacklist) {
-  const configFile = './data/history.json';
-  const sessionFolder = './data/session';
-  const sessionFile = path.join(sessionFolder, `${userid}.json`);
-  if (fs.existsSync(sessionFile)) return;
-  const config = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
-  config.push({
-    userid,
-    prefix: prefix || "",
-    admin: admin || [],
-    blacklist: blacklist || [],
-    enableCommands,
-    time: 0,
-  });
-  fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
-  fs.writeFileSync(sessionFile, JSON.stringify(state));
-}
+ ./fb-chat-api/index
+This repo is a fork from main repo and will usually have new features bundled faster than main repo (and maybe bundle some bugs, too).
 
-function aliases(command) {
-  const aliases = Array.from(Utils.commands.entries()).find(([commands]) => commands.includes(command?.toLowerCase()));
-  if (aliases) {
-    return aliases[1];
-  }
-  return null;
-}
-async function main() {
-  const empty = require('fs-extra');
-  const cacheFile = './script/cache';
-  if (!fs.existsSync(cacheFile)) fs.mkdirSync(cacheFile);
-  const configFile = './data/history.json';
-  if (!fs.existsSync(configFile)) fs.writeFileSync(configFile, '[]', 'utf-8');
-  const config = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
-  const sessionFolder = path.join('./data/session');
-  if (!fs.existsSync(sessionFolder)) fs.mkdirSync(sessionFolder);
-  const adminOfConfig = fs.existsSync('./data') && fs.existsSync('./data/config.json') ? JSON.parse(fs.readFileSync('./data/config.json', 'utf8')) : createConfig();
-  cron.schedule(`*/${adminOfConfig[0].masterKey.restartTime} * * * *`, async () => {
-    const history = JSON.parse(fs.readFileSync('./data/history.json', 'utf-8'));
-    history.forEach(user => {
-      (!user || typeof user !== 'object') ? process.exit(1): null;
-      (user.time === undefined || user.time === null || isNaN(user.time)) ? process.exit(1): null;
-      const update = Utils.account.get(user.userid);
-      update ? user.time = update.time : null;
-    });
-    await empty.emptyDir(cacheFile);
-    await fs.writeFileSync('./data/history.json', JSON.stringify(history, null, 2));
-    process.exit(1);
-  });
-  try {
-    for (const file of fs.readdirSync(sessionFolder)) {
-      const filePath = path.join(sessionFolder, file);
-      try {
-        const {
-          enableCommands,
-          prefix,
-          admin,
-          blacklist
-        } = config.find(item => item.userid === path.parse(file).name) || {};
-        const state = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-        if (enableCommands) await accountLogin(state, enableCommands, prefix, admin, blacklist);
-      } catch (error) {
-        deleteThisUser(path.parse(file).name);
-      }
-    }
-  } catch (error) {}
-}
+# Unofficial Facebook Chat API
+<a href="https://www.npmjs.com/package/fca-unofficial"><img alt="npm version" src="https://img.shields.io/npm/v/fca-unofficial.svg?style=flat-square"></a>
+<img alt="version" src="https://img.shields.io/github/package-json/v/fca-unofficial/fca-unofficial?label=github&style=flat-square">
+<a href="https://www.npmjs.com/package/fca-unofficial"><img src="https://img.shields.io/npm/dm/fca-unofficial.svg?style=flat-square" alt="npm downloads"></a>
+[![code style: prettier](https://img.shields.io/badge/code_style-prettier-ff69b4.svg?style=flat-square)](https://github.com/prettier/prettier)
 
-function createConfig() {
-  const config = [{
-    masterKey: {
-      admin: [],
-      devMode: false,
-      database: false,
-      restartTime: 15,
-    },
-    fcaOption: {
-      forceLogin: true,
-      listenEvents: true,
-      logLevel: "silent",
-      updatePresence: true,
-      selfListen: true,
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64",
-      online: true,
-      autoMarkDelivery: false,
-      autoMarkRead: false
-    }
-  }];
-  const dataFolder = './data';
-  if (!fs.existsSync(dataFolder)) fs.mkdirSync(dataFolder);
-  fs.writeFileSync('./data/config.json', JSON.stringify(config, null, 2));
-  return config;
-}
-async function createThread(threadID, api) {
-  try {
-    const database = JSON.parse(fs.readFileSync('./data/database.json', 'utf8'));
-    let threadInfo = await api.getThreadInfo(threadID);
-    let adminIDs = threadInfo ? threadInfo.adminIDs : [];
-    const data = {};
-    data[threadID] = adminIDs
-    database.push(data);
-    await fs.writeFileSync('./data/database.json', JSON.stringify(database, null, 2), 'utf-8');
-    return database;
-  } catch (error) {
-    console.log(error);
-  }
-}
-async function createDatabase() {
-  const data = './data';
-  const database = './data/database.json';
-  if (!fs.existsSync(data)) {
-    fs.mkdirSync(data, {
-      recursive: true
+Facebook now has an official API for chat bots [here](https://developers.facebook.com/docs/messenger-platform).
+
+This API is the only way to automate chat functionalities on a user account. We do this by emulating the browser. This means doing the exact same GET/POST requests and tricking Facebook into thinking we're accessing the website normally. Because we're doing it this way, this API won't work with an auth token but requires the credentials of a Facebook account.
+
+_Disclaimer_: We are not responsible if your account gets banned for spammy activities such as sending lots of messages to people you don't know, sending messages very quickly, sending spammy looking URLs, logging in and out very quickly... Be responsible Facebook citizens.
+
+See [below](#projects-using-this-api) for projects using this API.
+
+See the [full changelog](/CHANGELOG.md) for release details.
+
+## Install
+If you just want to use fca-unofficial, you should use this command:
+```bash
+npm install fca-unofficial
+```
+It will download `fca-unofficial` from NPM repositories
+
+### Bleeding edge
+If you want to use bleeding edge (directly from github) to test new features or submit bug report, this is the command for you:
+```bash
+npm install fca-unofficial/fca-unofficial
+```
+
+## Testing your bots
+If you want to test your bots without creating another account on Facebook, you can use [Facebook Whitehat Accounts](https://www.facebook.com/whitehat/accounts/).
+
+## Example Usage
+```javascript
+const login = require("fca-unofficial");
+
+// Create simple echo bot
+login({email: "FB_EMAIL", password: "FB_PASSWORD"}, (err, api) => {
+    if(err) return console.error(err);
+
+    api.listen((err, message) => {
+        api.sendMessage(message.body, message.threadID);
     });
-  }
-  if (!fs.existsSync(database)) {
-    fs.writeFileSync(database, JSON.stringify([]));
-  }
-  return database;
-}
-main()
-              
+});
+```
+
+Result:
+
+<img width="517" alt="screen shot 2016-11-04 at 14 36 00" src="https://cloud.githubusercontent.com/assets/4534692/20023545/f8c24130-a29d-11e6-9ef7-47568bdbc1f2.png">
+
+
+## Documentation
+
+You can see it [here](DOCS.md).
+
+## Main Functionality
+
+### Sending a message
+#### api.sendMessage(message, threadID[, callback][, messageID])
+
+Various types of message can be sent:
+* *Regular:* set field `body` to the desired message as a string.
+* *Sticker:* set a field `sticker` to the desired sticker ID.
+* *File or image:* Set field `attachment` to a readable stream or an array of readable streams.
+* *URL:* set a field `url` to the desired URL.
+* *Emoji:* set field `emoji` to the desired emoji as a string and set field `emojiSize` with size of the emoji (`small`, `medium`, `large`)
+
+Note that a message can only be a regular message (which can be empty) and optionally one of the following: a sticker, an attachment or a url.
+
+__Tip__: to find your own ID, you can look inside the cookies. The `userID` is under the name `c_user`.
+
+__Example (Basic Message)__
+```js
+const login = require("fca-unofficial");
+
+login({email: "FB_EMAIL", password: "FB_PASSWORD"}, (err, api) => {
+    if(err) return console.error(err);
+
+    var yourID = "000000000000000";
+    var msg = "Hey!";
+    api.sendMessage(msg, yourID);
+});
+```
+
+__Example (File upload)__
+```js
+const login = require("fca-unofficial");
+
+login({email: "FB_EMAIL", password: "FB_PASSWORD"}, (err, api) => {
+    if(err) return console.error(err);
+
+    // Note this example uploads an image called image.jpg
+    var yourID = "000000000000000";
+    var msg = {
+        body: "Hey!",
+        attachment: fs.createReadStream(__dirname + '/image.jpg')
+    }
+    api.sendMessage(msg, yourID);
+});
+```
+
+------------------------------------
+### Saving session.
+
+To avoid logging in every time you should save AppState (cookies etc.) to a file, then you can use it without having password in your scripts.
+
+__Example__
+
+```js
+const fs = require("fs");
+const login = require("fca-unofficial");
+
+var credentials = {email: "FB_EMAIL", password: "FB_PASSWORD"};
+
+login(credentials, (err, api) => {
+    if(err) return console.error(err);
+
+    fs.writeFileSync('appstate.json', JSON.stringify(api.getAppState()));
+});
+```
+
+Alternative: Use [c3c-fbstate](https://github.com/lequanglam/c3c-fbstate) to get fbstate.json (appstate.json)
+
+------------------------------------
+
+### Listening to a chat
+#### api.listen(callback)
+
+Listen watches for messages sent in a chat. By default this won't receive events (joining/leaving a chat, title change etc…) but it can be activated with `api.setOptions({listenEvents: true})`. This will by default ignore messages sent by the current account, you can enable listening to your own messages with `api.setOptions({selfListen: true})`.
+
+__Example__
+
+```js
+const fs = require("fs");
+const login = require("fca-unofficial");
+
+// Simple echo bot. It will repeat everything that you say.
+// Will stop when you say '/stop'
+login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, api) => {
+    if(err) return console.error(err);
+
+    api.setOptions({listenEvents: true});
+
+    var stopListening = api.listenMqtt((err, event) => {
+        if(err) return console.error(err);
+
+        api.markAsRead(event.threadID, (err) => {
+            if(err) console.error(err);
+        });
+
+        switch(event.type) {
+            case "message":
+                if(event.body === '/stop') {
+                    api.sendMessage("Goodbye…", event.threadID);
+                    return stopListening();
+                }
+                api.sendMessage("TEST BOT: " + event.body, event.threadID);
+                break;
+            case "event":
+                console.log(event);
+                break;
+        }
+    });
+});
+```
+
+## FAQS
+
+1. How do I run tests?
+> For tests, create a `test-config.json` file that resembles `example-config.json` and put it in the `test` directory. From the root >directory, run `npm test`.
+
+2. Why doesn't `sendMessage` always work when I'm logged in as a page?
+> Pages can't start conversations with users directly; this is to prevent pages from spamming users.
+
+3. What do I do when `login` doesn't work?
+> First check that you can login to Facebook using the website. If login approvals are enabled, you might be logging in incorrectly. For how to handle login approvals, read our docs on [`login`](DOCS.md#login).
+
+4. How can I avoid logging in every time?  Can I log into a previous session?
+> We support caching everything relevant for you to bypass login. `api.getAppState()` returns an object that you can save and pass into login as `{appState: mySavedAppState}` instead of the credentials object.  If this fails, your session has expired.
+
+5. Do you support sending messages as a page?
+> Yes, set the pageID option on login (this doesn't work if you set it using api.setOptions, it affects the login process).
+> ```js
+> login(credentials, {pageID: "000000000000000"}, (err, api) => { … }
+> ```
+
+6. I'm getting some crazy weird syntax error like `SyntaxError: Unexpected token [`!!!
+> Please try to update your version of node.js before submitting an issue of this nature.  We like to use new language features.
+
+7. I don't want all of these logging messages!
+> You can use `api.setOptions` to silence the logging. You get the `api` object from `login` (see example above). Do
+> ```js
+> api.setOptions({
+>     logLevel: "silent"
+> });
+> ```
+
+<a name="projects-using-this-api"></a>
+## Projects using this API:
+
+- [c3c](https://github.com/lequanglam/c3c) - A bot that can be customizable using plugins. Support Facebook & Discord.
+
+## Projects using this API (original repository, facebook-chat-api):
+
+- [Messer](https://github.com/mjkaufer/Messer) - Command-line messaging for Facebook Messenger
+- [messen](https://github.com/tomquirk/messen) - Rapidly build Facebook Messenger apps in Node.js
+- [Concierge](https://github.com/concierge/Concierge) - Concierge is a highly modular, easily extensible general purpose chat bot with a built in package manager
+- [Marc Zuckerbot](https://github.com/bsansouci/marc-zuckerbot) - Facebook chat bot
+- [Marc Thuckerbot](https://github.com/bsansouci/lisp-bot) - Programmable lisp bot
+- [MarkovsInequality](https://github.com/logicx24/MarkovsInequality) - Extensible chat bot adding useful functions to Facebook Messenger
+- [AllanBot](https://github.com/AllanWang/AllanBot-Public) - Extensive module that combines the facebook api with firebase to create numerous functions; no coding experience is required to implement this.
+- [Larry Pudding Dog Bot](https://github.com/Larry850806/facebook-chat-bot) - A facebook bot you can easily customize the response
+- [fbash](https://github.com/avikj/fbash) - Run commands on your computer's terminal over Facebook Messenger
+- [Klink](https://github.com/KeNt178/klink) - This Chrome extension will 1-click share the link of your active tab over Facebook Messenger
+- [Botyo](https://github.com/ivkos/botyo) - Modular bot designed for group chat rooms on Facebook
+- [matrix-puppet-facebook](https://github.com/matrix-hacks/matrix-puppet-facebook) - A facebook bridge for [matrix](https://matrix.org)
+- [facebot](https://github.com/Weetbix/facebot) - A facebook bridge for Slack.
+- [Botium](https://github.com/codeforequity-at/botium-core) - The Selenium for Chatbots
+- [Messenger-CLI](https://github.com/AstroCB/Messenger-CLI) - A command-line interface for sending and receiving messages through Facebook Messenger.
+- [AssumeZero-Bot](https://github.com/AstroCB/AssumeZero-Bot) – A highly customizable Facebook Messenger bot for group chats.
+- [Miscord](https://github.com/Bjornskjald/miscord) - An easy-to-use Facebook bridge for Discord.
+- [chat-bridge](https://github.com/rexx0520/chat-bridge) - A Messenger, Telegram and IRC chat bridge.
+- [messenger-auto-reply](https://gitlab.com/theSander/messenger-auto-reply) - An auto-reply service for Messenger.
+- [BotCore](https://github.com/AstroCB/BotCore) – A collection of tools for writing and managing Facebook Messenger bots.
+- [mnotify](https://github.com/AstroCB/mnotify) – A command-line utility for sending alerts and notifications through Facebook Messenger.
